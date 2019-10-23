@@ -1,14 +1,24 @@
 package com.alibaba.excel.analysis.v07;
 
-import com.alibaba.excel.analysis.BaseSaxAnalyser;
-import com.alibaba.excel.context.AnalysisContext;
-import com.alibaba.excel.exception.ExcelAnalysisException;
-import com.alibaba.excel.metadata.Sheet;
-import org.apache.poi.openxml4j.exceptions.OpenXML4JException;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
+import javax.xml.parsers.SAXParser;
+import javax.xml.parsers.SAXParserFactory;
+
 import org.apache.poi.openxml4j.opc.OPCPackage;
+import org.apache.poi.openxml4j.opc.PackageAccess;
+import org.apache.poi.openxml4j.opc.PackagePart;
+import org.apache.poi.ss.usermodel.Sheet;
 import org.apache.poi.xssf.eventusermodel.XSSFReader;
-import org.apache.poi.xssf.model.SharedStringsTable;
-import org.apache.xmlbeans.XmlException;
+import org.apache.poi.xssf.model.StylesTable;
+import org.apache.poi.xssf.usermodel.XSSFRelation;
 import org.openxmlformats.schemas.spreadsheetml.x2006.main.CTWorkbook;
 import org.openxmlformats.schemas.spreadsheetml.x2006.main.CTWorkbookPr;
 import org.openxmlformats.schemas.spreadsheetml.x2006.main.WorkbookDocument;
@@ -16,75 +26,129 @@ import org.xml.sax.ContentHandler;
 import org.xml.sax.InputSource;
 import org.xml.sax.XMLReader;
 
-import javax.xml.parsers.SAXParser;
-import javax.xml.parsers.SAXParserFactory;
-import java.io.IOException;
-import java.io.InputStream;
-import java.util.ArrayList;
-import java.util.List;
+import com.alibaba.excel.analysis.ExcelReadExecutor;
+import com.alibaba.excel.cache.ReadCache;
+import com.alibaba.excel.context.AnalysisContext;
+import com.alibaba.excel.exception.ExcelAnalysisException;
+import com.alibaba.excel.read.metadata.ReadSheet;
+import com.alibaba.excel.read.metadata.holder.ReadWorkbookHolder;
+import com.alibaba.excel.util.CollectionUtils;
+import com.alibaba.excel.util.FileUtils;
+import com.alibaba.excel.util.SheetUtils;
+import com.alibaba.excel.util.StringUtils;
 
 /**
  *
  * @author jipengfei
  */
-public class XlsxSaxAnalyser extends BaseSaxAnalyser {
+public class XlsxSaxAnalyser implements ExcelReadExecutor {
 
-    private XSSFReader xssfReader;
+    private AnalysisContext analysisContext;
+    private List<ReadSheet> sheetList;
+    private Map<Integer, InputStream> sheetMap;
+    /**
+     * Current style information
+     */
+    private StylesTable stylesTable;
 
-    private SharedStringsTable sharedStringsTable;
-
-    private List<SheetSource> sheetSourceList = new ArrayList<SheetSource>();
-
-    private boolean use1904WindowDate = false;
-
-    public XlsxSaxAnalyser(AnalysisContext analysisContext) throws IOException, OpenXML4JException, XmlException {
+    public XlsxSaxAnalyser(AnalysisContext analysisContext, InputStream decryptedStream) throws Exception {
         this.analysisContext = analysisContext;
+        // Initialize cache
+        ReadWorkbookHolder readWorkbookHolder = analysisContext.readWorkbookHolder();
 
-        analysisContext.setCurrentRowNum(0);
-        this.xssfReader = new XSSFReader(OPCPackage.open(analysisContext.getInputStream()));
-        this.sharedStringsTable = this.xssfReader.getSharedStringsTable();
+        OPCPackage pkg = readOpcPackage(readWorkbookHolder, decryptedStream);
+        readWorkbookHolder.setOpcPackage(pkg);
 
+        ArrayList<PackagePart> packageParts = pkg.getPartsByContentType(XSSFRelation.SHARED_STRINGS.getContentType());
+
+        if (!CollectionUtils.isEmpty(packageParts)) {
+            PackagePart sharedStringsTablePackagePart = packageParts.get(0);
+
+            // Specify default cache
+            defaultReadCache(readWorkbookHolder, sharedStringsTablePackagePart);
+
+            // Analysis sharedStringsTable.xml
+            analysisSharedStringsTable(sharedStringsTablePackagePart.getInputStream(), readWorkbookHolder);
+        }
+
+        XSSFReader xssfReader = new XSSFReader(pkg);
+        analysisUse1904WindowDate(xssfReader, readWorkbookHolder);
+
+        stylesTable = xssfReader.getStylesTable();
+        sheetList = new ArrayList<ReadSheet>();
+        sheetMap = new HashMap<Integer, InputStream>();
+        XSSFReader.SheetIterator ite = (XSSFReader.SheetIterator)xssfReader.getSheetsData();
+        int index = 0;
+        if (!ite.hasNext()) {
+            throw new ExcelAnalysisException("Can not find any sheet!");
+        }
+        while (ite.hasNext()) {
+            InputStream inputStream = ite.next();
+            sheetList.add(new ReadSheet(index, ite.getSheetName()));
+            sheetMap.put(index, inputStream);
+            index++;
+        }
+    }
+
+    private void defaultReadCache(ReadWorkbookHolder readWorkbookHolder, PackagePart sharedStringsTablePackagePart) {
+        ReadCache readCache = readWorkbookHolder.getReadCacheSelector().readCache(sharedStringsTablePackagePart);
+        readWorkbookHolder.setReadCache(readCache);
+        readCache.init(analysisContext);
+    }
+
+    private void analysisUse1904WindowDate(XSSFReader xssfReader, ReadWorkbookHolder readWorkbookHolder)
+        throws Exception {
+        if (readWorkbookHolder.globalConfiguration().getUse1904windowing() != null) {
+            return;
+        }
         InputStream workbookXml = xssfReader.getWorkbookData();
         WorkbookDocument ctWorkbook = WorkbookDocument.Factory.parse(workbookXml);
         CTWorkbook wb = ctWorkbook.getWorkbook();
         CTWorkbookPr prefix = wb.getWorkbookPr();
-        if (prefix != null) {
-            this.use1904WindowDate = prefix.getDate1904();
+        if (prefix != null && prefix.getDate1904()) {
+            readWorkbookHolder.getGlobalConfiguration().setUse1904windowing(Boolean.TRUE);
+        } else {
+            readWorkbookHolder.getGlobalConfiguration().setUse1904windowing(Boolean.FALSE);
         }
-        this.analysisContext.setUse1904WindowDate(use1904WindowDate);
+    }
 
+    private void analysisSharedStringsTable(InputStream sharedStringsTableInputStream,
+        ReadWorkbookHolder readWorkbookHolder) throws Exception {
+        ContentHandler handler = new SharedStringsTableHandler(readWorkbookHolder.getReadCache());
+        parseXmlSource(sharedStringsTableInputStream, handler);
+        readWorkbookHolder.getReadCache().putFinished();
+    }
 
-        XSSFReader.SheetIterator ite;
-        sheetSourceList = new ArrayList<SheetSource>();
-        ite = (XSSFReader.SheetIterator)xssfReader.getSheetsData();
-        while (ite.hasNext()) {
-            InputStream inputStream = ite.next();
-            String sheetName = ite.getSheetName();
-            SheetSource sheetSource = new SheetSource(sheetName, inputStream);
-            sheetSourceList.add(sheetSource);
+    private OPCPackage readOpcPackage(ReadWorkbookHolder readWorkbookHolder, InputStream decryptedStream)
+        throws Exception {
+        if (decryptedStream == null && readWorkbookHolder.getFile() != null) {
+            return OPCPackage.open(readWorkbookHolder.getFile());
         }
-
+        if (readWorkbookHolder.getMandatoryUseInputStream()) {
+            if (decryptedStream != null) {
+                return OPCPackage.open(decryptedStream);
+            } else {
+                return OPCPackage.open(readWorkbookHolder.getInputStream());
+            }
+        }
+        File readTempFile = FileUtils.createCacheTmpFile();
+        readWorkbookHolder.setTempFile(readTempFile);
+        File tempFile = new File(readTempFile.getPath(), UUID.randomUUID().toString() + ".xlsx");
+        if (decryptedStream != null) {
+            FileUtils.writeToFile(tempFile, decryptedStream);
+        } else {
+            FileUtils.writeToFile(tempFile, readWorkbookHolder.getInputStream());
+        }
+        return OPCPackage.open(tempFile, PackageAccess.READ);
     }
 
     @Override
-    protected void execute() {
-        Sheet sheetParam = analysisContext.getCurrentSheet();
-        if (sheetParam != null && sheetParam.getSheetNo() > 0 && sheetSourceList.size() >= sheetParam.getSheetNo()) {
-            InputStream sheetInputStream = sheetSourceList.get(sheetParam.getSheetNo() - 1).getInputStream();
-            parseXmlSource(sheetInputStream);
-
-        } else {
-            int i = 0;
-            for (SheetSource sheetSource : sheetSourceList) {
-                i++;
-                analysisContext.setCurrentSheet(new Sheet(i));
-                parseXmlSource(sheetSource.getInputStream());
-            }
-        }
+    public List<ReadSheet> sheetList() {
+        return sheetList;
     }
 
-    private void parseXmlSource(InputStream inputStream) {
-        InputSource sheetSource = new InputSource(inputStream);
+    private void parseXmlSource(InputStream inputStream, ContentHandler handler) {
+        InputSource inputSource = new InputSource(inputStream);
         try {
             SAXParserFactory saxFactory = SAXParserFactory.newInstance();
             saxFactory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
@@ -92,55 +156,35 @@ public class XlsxSaxAnalyser extends BaseSaxAnalyser {
             saxFactory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
             SAXParser saxParser = saxFactory.newSAXParser();
             XMLReader xmlReader = saxParser.getXMLReader();
-            ContentHandler handler = new XlsxRowHandler(this, sharedStringsTable, analysisContext);
             xmlReader.setContentHandler(handler);
-            xmlReader.parse(sheetSource);
+            xmlReader.parse(inputSource);
             inputStream.close();
+        } catch (ExcelAnalysisException e) {
+            throw e;
         } catch (Exception e) {
-            e.printStackTrace();
             throw new ExcelAnalysisException(e);
+        } finally {
+            if (inputStream != null) {
+                try {
+                    inputStream.close();
+                } catch (IOException e) {
+                    throw new ExcelAnalysisException("Can not close 'inputStream'!");
+                }
+            }
         }
     }
 
     @Override
-    public List<Sheet> getSheets() {
-        List<Sheet> sheets = new ArrayList<Sheet>();
-        int i = 1;
-        for (SheetSource sheetSource : sheetSourceList) {
-            Sheet sheet = new Sheet(i, 0);
-            sheet.setSheetName(sheetSource.getSheetName());
-            i++;
-            sheets.add(sheet);
-        }
-
-        return sheets;
-    }
-
-    class SheetSource {
-
-        private String sheetName;
-
-        private InputStream inputStream;
-
-        public SheetSource(String sheetName, InputStream inputStream) {
-            this.sheetName = sheetName;
-            this.inputStream = inputStream;
-        }
-
-        public String getSheetName() {
-            return sheetName;
-        }
-
-        public void setSheetName(String sheetName) {
-            this.sheetName = sheetName;
-        }
-
-        public InputStream getInputStream() {
-            return inputStream;
-        }
-
-        public void setInputStream(InputStream inputStream) {
-            this.inputStream = inputStream;
+    public void execute(List<ReadSheet> readSheetList, Boolean readAll) {
+        for (ReadSheet readSheet : sheetList) {
+            readSheet = SheetUtils.match(readSheet, readSheetList, readAll,
+                analysisContext.readWorkbookHolder().getGlobalConfiguration());
+            if (readSheet != null) {
+                analysisContext.currentSheet(readSheet);
+                parseXmlSource(sheetMap.get(readSheet.getSheetNo()), new XlsxRowHandler(analysisContext, stylesTable));
+                // The last sheet is read
+                analysisContext.readSheetHolder().notifyAfterAllAnalysed(analysisContext);
+            }
         }
     }
 }
